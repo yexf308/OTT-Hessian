@@ -1,8 +1,10 @@
 import jax
 import numpy as np
 import jax.numpy as jnp
+from jaxtyping import Array, Float 
 from jax.example_libraries import optimizers as jax_opt
 import optax
+import lineax as lx
 
 import time
 import timeit
@@ -12,6 +14,84 @@ from ott.geometry import pointcloud
 from ott.problems.linear import linear_problem
 from ott.solvers.linear import sinkhorn
 from ott.solvers.linear import implicit_differentiation as imp_diff
+
+
+    
+def HessianA(A,out, tau2, iter):
+        f = out.f
+        g = out.g
+        n = len(f)
+        m = len(g)
+        epsilon = out.geom.epsilon
+        a = out.geom.apply_transport_from_potentials(f,g,jnp.ones(m),axis=1)
+        b = out.geom.apply_transport_from_potentials(f,g,jnp.ones(n),axis=0)
+        x = out.geom.x
+        y = out.geom.y
+        yT = y.T
+        
+        # RA
+        vec1 = jnp.sum(x * A, axis=1)
+        Mat1 = out.geom.apply_transport_from_potentials(f,g,y.T,axis=1)
+        x1  = 2*(a * vec1 - jnp.sum(A * Mat1.T, axis=1))
+        Mat2 = out.geom.apply_transport_from_potentials(f,g,A.T,axis=0)
+        x2 = 2*(out.geom.apply_transport_from_potentials(f,g, vec1,axis=0) - jnp.sum(y * Mat2.T, axis=1))
+
+        # Solve Hx
+        apply_potentials_1 = jax.jit(lambda x:  out.geom.apply_transport_from_potentials(f,g,x,axis=1))
+        apply_potentials_0 = jax.jit(lambda x:  out.geom.apply_transport_from_potentials(f,g,x,axis=0))
+
+        
+        y1= x1/(a)
+        y2 = -apply_potentials_0(y1) + x2
+        m = len(g)
+
+        def T(z: Float[Array, str(m)]) -> Float[Array, str(m)]:
+            piz = apply_potentials_1(z)
+            piT_over_a_piz = apply_potentials_0(piz/a)
+            return (b+epsilon*tau2)*z - piT_over_a_piz
+            
+
+        in_structure = jax.eval_shape(lambda: y2)
+        fn_operator = lx.FunctionLinearOperator(T, in_structure, tags=lx.positive_semidefinite_tag)
+        
+        solver = lx.CG(rtol=1e-6, atol=1e-6, max_steps=iter)
+        z = lx.linear_solve(fn_operator, y2, solver).value
+
+        z1 = y1 - apply_potentials_1(z)/(a)
+        z2 = z
+
+        # RTz
+        vec1 = a * z1 
+        Mat1 = x * vec1[:, None]
+        Mat2 = out.geom.apply_transport_from_potentials(f,g,yT,axis=1) * z1
+        vec2 = out.geom.apply_transport_from_potentials(f,g,z2,axis=1)
+        Mat3 = x * vec2[:, None]
+        Mat4 = out.geom.apply_transport_from_potentials(f, g, (yT * z2) , axis=1) 
+
+        Part1 = 2*(Mat1 - Mat2.T + Mat3 - Mat4.T)
+
+        # EA
+        n =  A.shape[0]
+        d =  A.shape[1]
+        Mat1 = 2 * a[:, None] * A
+        vec1 = jnp.sum(x * A, axis=1)
+        Mat2 = -4/epsilon * x * (vec1*a)[:, None]
+        Py   = out.geom.apply_transport_from_potentials(f,g,y.T,axis=1)
+        PyT = Py.T
+        Mat3 = 4/epsilon * PyT * vec1[:, None]
+        vec2 = jnp.sum(PyT * A , axis=1)
+        Mat4 = 4/epsilon * x * vec2[:, None]
+        Mat5 = jnp.zeros((n,d))
+        for i in range(d):
+            YiY = y[:,i][:,None] * y
+            Mat_i =  out.geom.apply_transport_from_potentials(f,g,YiY.T,axis=1).T
+            vec_i = jnp.sum(Mat_i * A, axis=1)
+            Mat5 = Mat5.at[:,i].set(-4/epsilon * vec_i)
+        
+        Part2 = Mat1 + Mat2 + Mat3 + Mat4 + Mat5
+
+        return Part1/epsilon+ Part2
+            
 
 
 class SinkhornHessian:
