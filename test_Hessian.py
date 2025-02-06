@@ -31,13 +31,13 @@ import mpl_toolkits.axes_grid1
 #%%
 n = 5000
 m = 10000
-epsilon = 0.01
+epsilon = 0.0025
 dim = 5
 threshold = 0.01 / (n**0.33)
 tau2 =1e-5
-iter = 100
-mu, nv1, x, y1 = util.sample_points_uniform(n, n, dim, 1)
-mu1, nv, x1, y = util.sample_points_uniform(m, m, dim, 1)
+iter = 10
+mu, nv1, x, y1 = util.sample_points_uniform(n, n, dim, 4)
+mu1, nv, x1, y = util.sample_points_uniform(m, m, dim, 10)
 #y = x
 
 xT = x.T
@@ -60,13 +60,21 @@ A = np.random.randn(n, dim)
 #%% materialize the hessian
 svd_thr = 1e-10
 SH = SinkhornHessian.SinkhornHessian(svd_thr)
-H = SH.LHS_matrix(out)
+#H = SH.LHS_matrix(out)
 T = SH.compute_hessian(out)
 result1 = jnp.tensordot(T, A, axes=((2,3), (0,1)))
 
 #%% compute the hessian dot A without materializing the hessian
+# without preconditioning
 result2 = SinkhornHessian.HessianA(A,out, tau2, iter)
 
+# with preconditioning
+result3 = SinkhornHessian.HessianAPrecond(A,out, tau2, iter)
 #%% compare the results
+print("The max error between the true Hessian and without preconditioning is:")
 print(jnp.max(jnp.abs(result1 - result2)))
+
+
+print("The max error between the true Hessian and with preconditioning is:")
+print(jnp.max(jnp.abs(result1 - result3)))
 
