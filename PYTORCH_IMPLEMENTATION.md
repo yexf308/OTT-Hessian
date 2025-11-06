@@ -9,11 +9,7 @@ Complete PyTorch port of the Sinkhorn Hessian utilities with analytical formulas
 ✅ **torch.compile Support**: JIT compilation matching JAX performance  
 ✅ **Numerical Stability**: Log-domain Sinkhorn for extreme cases  
 ✅ **Full JAX Compatibility**: Verified to match within 3.34e-04  
-<<<<<<< HEAD
 ✅ **GeomLoss Backend (optional)**: Switch to `solver="geomloss"` to reuse GeomLoss' optimized Sinkhorn while preserving the squared Euclidean cost (no ½ factor) with balanced transport plans
-=======
-✅ **GeomLoss Backend (optional)**: Switch to `solver="geomloss"` to reuse GeomLoss' optimized Sinkhorn while preserving the squared Euclidean cost (no ½ factor) with balanced transport plans
->>>>>>> 7a82419 (Add GeomLoss Sinkhorn backend with balanced plan and gradients)
 
 ---
 
