@@ -627,7 +627,7 @@ class ShuffledRegression:
         return self.x @ params
     
     @staticmethod
-    def parames_error(params_list, w):
+    def params_error(params_list, w):
         error = []
         for params in params_list:
             error.append(jnp.linalg.norm(params-w))
