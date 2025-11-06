@@ -49,7 +49,7 @@ def _prepare_common_terms(A, out):
     vec_transport = apply_axis0(vec_xA)
     vec_y_mat2 = jnp.sum(y * transport_AT.T, axis=1)
 
-    x1 = 2.0 * (a * vec_xA - jnp.einsum("nd,nd->n", A, transport_yT))
+    x1 = 2.0 * (a * vec_xA - jnp.einsum("nd,nd->n", A, transport_yT.T))
     x2 = 2.0 * (vec_transport - vec_y_mat2)
 
     return {
