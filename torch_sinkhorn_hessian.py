@@ -332,16 +332,27 @@ class TorchSinkhornHessian:
             and self.max_iterations > _COMPILED_MAX_ITERS
             and self.use_compile
         ):
-            cost, plan, _, iterations_value, _ = self._run_sinkhorn(
-                x_t,
-                y_t,
-                mu_t,
-                nv_t,
-                eps,
-                threshold,
-                self.max_iterations,
-                impl=self._fallback_sinkhorn,
-            )
+            previous_impl = self._sinkhorn
+            previous_use_compile = self.use_compile
+            try:
+                # If the compiled variant fails to converge within the
+                # truncated iteration budget, fall back to the plain
+                # implementation which honours ``max_iterations``.
+                self._sinkhorn = self._fallback_sinkhorn
+                self.use_compile = False
+                cost, plan, _, iterations_value, _ = self._run_sinkhorn(
+                    x_t,
+                    y_t,
+                    mu_t,
+                    nv_t,
+                    eps,
+                    threshold,
+                    self.max_iterations,
+                    impl=self._fallback_sinkhorn,
+                )
+            finally:
+                self._sinkhorn = previous_impl
+                self.use_compile = previous_use_compile
         geom = _TorchGeometry(x=x_t, y=y_t, epsilon=eps)
         return TorchOTResult(
             geom=geom,
