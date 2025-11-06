@@ -11,8 +11,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import warnings
 
 import torch
+
+try:  # Optional import for GeomLoss-based solver
+    from geomloss.samples_loss import sinkhorn_tensorized as _geomloss_sinkhorn
+    from geomloss.sinkhorn_divergence import log_weights as _geomloss_log_weights
+except Exception:  # pragma: no cover - GeomLoss is optional
+    _geomloss_sinkhorn = None
+    _geomloss_log_weights = None
 
 
 # ---------------------------------------------------------------------------
@@ -269,20 +277,35 @@ class TorchSinkhornHessian:
         dtype: torch.dtype = torch.float64,
         use_compile: Optional[bool] = None,
         use_keops: bool = False,
+        solver: str = "native",
+        geomloss_scaling: float = 0.9,
     ) -> None:
         self.svd_thr = svd_thr
         self.max_iterations = max_iterations
         self.device = device or torch.device("cpu")
         self.dtype = dtype
         self.use_keops = use_keops
-        
-        if use_compile is None:
-            use_compile = getattr(torch, "compile", None) is not None
-        if use_compile:
-            sinkhorn_impl = _get_compiled_sinkhorn()
+        solver = solver.lower()
+        if solver not in {"native", "geomloss"}:
+            raise ValueError("solver must be either 'native' or 'geomloss'")
+        self.solver = solver
+        self.geomloss_scaling = float(geomloss_scaling)
+        if self.solver == "geomloss":
+            if _geomloss_sinkhorn is None or _geomloss_log_weights is None:
+                raise ImportError(
+                    "GeomLoss is not available. Install geomloss or use solver='native'."
+                )
+            self.use_compile = False
+            sinkhorn_impl = None
         else:
-            sinkhorn_impl = _sinkhorn
-        self.use_compile = sinkhorn_impl is not _sinkhorn
+            if use_compile is None:
+                use_compile = getattr(torch, "compile", None) is not None
+            if use_compile:
+                sinkhorn_impl = _get_compiled_sinkhorn()
+            else:
+                sinkhorn_impl = _sinkhorn
+            self.use_compile = sinkhorn_impl is not _sinkhorn
+        self.last_cg_info: Optional[dict] = None
         self._sinkhorn = sinkhorn_impl
 
     # ------------------------------------------------------------------
@@ -312,6 +335,14 @@ class TorchSinkhornHessian:
         threshold: float,
         max_iterations: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        if self.solver == "geomloss":
+            return self._run_geomloss(
+                x,
+                y,
+                mu,
+                nu,
+                epsilon,
+            )
         result = self._sinkhorn(
             x,
             y,
@@ -342,6 +373,75 @@ class TorchSinkhornHessian:
         else:
             iterations_value = int(iterations)
         return cost, plan, cost_matrix, iterations_value, residual, f, g
+
+    def _run_geomloss(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mu: torch.Tensor,
+        nu: torch.Tensor,
+        epsilon: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Sinkhorn solver backed by GeomLoss."""
+
+        if _geomloss_sinkhorn is None or _geomloss_log_weights is None:
+            raise RuntimeError("GeomLoss solver requested but geomloss is not installed.")
+
+        # GeomLoss expects batched inputs; add batch dimension.
+        x_b = x.unsqueeze(0)
+        y_b = y.unsqueeze(0)
+        mu_b = mu.unsqueeze(0)
+        nu_b = nu.unsqueeze(0)
+
+        # blur^2 corresponds to epsilon for p=2
+        blur = torch.tensor(epsilon, dtype=self.dtype, device=self.device).sqrt()
+
+        def _cost_fn(a_pts: torch.Tensor, b_pts: torch.Tensor) -> torch.Tensor:
+            diff = a_pts[:, :, None, :] - b_pts[:, None, :, :]
+            return torch.sum(diff * diff, dim=-1)
+
+        f_ba, g_ab = _geomloss_sinkhorn(
+            mu_b,
+            x_b,
+            nu_b,
+            y_b,
+            p=2,
+            blur=float(blur.item()),
+            scaling=self.geomloss_scaling,
+            cost=_cost_fn,
+            debias=False,
+            potentials=True,
+        )
+
+        cost_matrix = _cost_fn(x_b, y_b).squeeze(0)
+
+        epsilon_t = blur.pow(2)
+        log_mu = torch.log(mu + 1e-300)
+        log_nu = torch.log(nu + 1e-300)
+        f = f_ba.squeeze(0) + epsilon_t * log_mu
+        g = g_ab.squeeze(0) + epsilon_t * log_nu
+
+        plan = torch.exp((f[:, None] + g[None, :] - cost_matrix) / epsilon_t)
+
+        balance_tol = 1e-8
+        balance_max_iter = 500
+        for _ in range(balance_max_iter):
+            row = plan.sum(dim=1)
+            row_scaling = mu / (row + 1e-30)
+            plan = plan * row_scaling[:, None]
+            f = f + epsilon_t * torch.log(row_scaling)
+
+            col = plan.sum(dim=0)
+            col_scaling = nu / (col + 1e-30)
+            plan = plan * col_scaling[None, :]
+            g = g + epsilon_t * torch.log(col_scaling)
+
+            if torch.max(torch.abs(row - mu)) < balance_tol and torch.max(torch.abs(col - nu)) < balance_tol:
+                break
+
+        reg_cost = torch.sum(plan * cost_matrix) + epsilon_t * torch.sum(plan * (torch.log(plan + 1e-30) - 1.0))
+        iterations = -1  # GeomLoss hides internal iteration count
+        return reg_cost, plan, cost_matrix, iterations, None, f, g
 
     def solve_ott(
         self,
@@ -463,6 +563,13 @@ class TorchSinkhornHessian:
     # Differential quantities
 
     def dOTdx(self, ot: TorchOTResult) -> torch.Tensor:
+        if self.solver == "geomloss":
+            x = ot.geom.x
+            y = ot.geom.y
+            plan = ot.matrix
+            # Gradient of 0.5‖x-y‖^2? For full squared cost we use 2*(x-y)
+            return torch.sum(plan[:, :, None] * 2.0 * (x[:, None, :] - y[None, :, :]), dim=1)
+
         x = ot.geom.x.clone().detach().requires_grad_(True)
         cost, _, _, _, _, _, _ = self._run_sinkhorn(
             x,
@@ -788,22 +895,33 @@ class TorchSinkhornHessian:
     def hessian_vector_product(
         self,
         ot: TorchOTResult,
-        A: torch.Tensor,
+        A,
         tau2: float = 1e-5,
-        max_cg_iter: int = 100,
-    ) -> torch.Tensor:
+        max_cg_iter: int = 300,
+        *,
+        cg_rtol: float = 1e-6,
+        cg_atol: float = 1e-6,
+        use_preconditioner: bool = True,
+        return_info: bool = False,
+    ):
         """Compute Hessian @ A without materializing the Hessian.
         
         Memory-efficient for large-scale problems. Ported from test.py.
         
         Args:
-            ot: OT solution containing transport plan and potentials
-            A: Vector/matrix to multiply with Hessian (shape: n × d)
-            tau2: Regularization parameter for linear system
-            max_cg_iter: Maximum iterations for conjugate gradient solver
+            ot: OT solution containing transport plan and potentials.
+            A: Vector/matrix to multiply with Hessian (shape: n × d).
+            tau2: Regularization parameter for linear system.
+            max_cg_iter: Maximum iterations for conjugate gradient solver.
+            cg_rtol: Relative tolerance for CG termination.
+            cg_atol: Absolute tolerance for CG termination.
+            use_preconditioner: If True, apply Neumann-style preconditioning mirroring the
+                JAX implementation for faster convergence.
+            return_info: When True, also return CG diagnostics (`dict`).
             
         Returns:
-            Hessian @ A (shape: n × d) without ever materializing full Hessian
+            Hessian @ A (shape: n × d) without ever materializing full Hessian. When
+            ``return_info`` is True, also returns a diagnostics dictionary with CG stats.
             
         Memory: O(n*d) instead of O(n²*d²) for materialized Hessian
         """
@@ -814,13 +932,18 @@ class TorchSinkhornHessian:
         epsilon = ot.geom.epsilon
         n = x.shape[0]
         m = y.shape[0]
+
+        # Ensure direction is a tensor on the correct device/dtype
+        A = _to_tensor(A, device=x.device, dtype=x.dtype)
         
         # Get transport functions
         apply_axis0, apply_axis1 = self._transport_functions(ot)
         
         # Compute marginals
-        a = apply_axis1(torch.ones(m, device=x.device, dtype=x.dtype))  # (n,)
-        b = apply_axis0(torch.ones(n, device=x.device, dtype=x.dtype))  # (m,)
+        ones_m = torch.ones(m, device=x.device, dtype=x.dtype)
+        ones_n = torch.ones(n, device=x.device, dtype=x.dtype)
+        a = apply_axis1(ones_m)  # (n,)
+        b = apply_axis0(ones_n)  # (m,)
         
         # Step 1: Compute R @ A (following test.py exactly)
         vec1 = torch.sum(x * A, dim=1)  # (n,)
@@ -830,18 +953,60 @@ class TorchSinkhornHessian:
         Mat2 = apply_axis0(A.t())  # (d, n) → (d, m)
         x2 = 2 * (apply_axis0(vec1) - torch.sum(y * Mat2.t(), dim=1))  # (m,)
         
-        # Step 2: Solve linear system T(z) = y2
+        # Step 2: Solve linear system
         y1 = x1 / a  # (n,)
-        y2 = -apply_axis0(y1) + x2  # (m,)
-        
-        # Define linear operator
-        def T(z):
-            piz = apply_axis1(z)  # (m,) → (n,)
-            piT_over_a_piz = apply_axis0(piz / a)  # (n,) → (m,)
-            return (b + epsilon * tau2) * z - piT_over_a_piz
-        
+        y2_raw = -apply_axis0(y1) + x2  # (m,)
+        denom = b + epsilon * tau2
+
+        def _apply_B(z_vec: torch.Tensor) -> torch.Tensor:
+            z_vec = z_vec.reshape(-1)
+            piz = apply_axis1(z_vec)
+            piT_over_a_piz = apply_axis0(piz / a)
+            return piT_over_a_piz / denom
+
+        if use_preconditioner:
+            rhs = y2_raw / denom
+
+            def linear_op(z_vec: torch.Tensor) -> torch.Tensor:
+                return z_vec - _apply_B(z_vec)
+
+            def preconditioner(vec: torch.Tensor) -> torch.Tensor:
+                b1 = _apply_B(vec)
+                b2 = _apply_B(b1)
+                b3 = _apply_B(b2)
+                return vec + b1 + b2 + b3
+        else:
+            rhs = y2_raw
+
+            def linear_op(z_vec: torch.Tensor) -> torch.Tensor:
+                z_vec = z_vec.reshape(-1)
+                piz = apply_axis1(z_vec)
+                piT_over_a_piz = apply_axis0(piz / a)
+                return denom * z_vec - piT_over_a_piz
+
+            preconditioner = None  # type: ignore
+
         # Solve using CG
-        z = self._conjugate_gradient(T, y2, max_iter=max_cg_iter)  # (m,)
+        z, cg_info = self._conjugate_gradient(
+            linear_op,
+            rhs,
+            max_iter=max_cg_iter,
+            rtol=cg_rtol,
+            atol=cg_atol,
+            preconditioner=preconditioner if use_preconditioner else None,
+            return_info=True,
+        )
+        self.last_cg_info = cg_info
+        if not cg_info["cg_converged"]:
+            warnings.warn(
+                (
+                    "Conjugate gradient did not converge within the allotted iterations. "
+                    f"residual={cg_info['cg_residual']:.3e} "
+                    f"(initial={cg_info['cg_initial_residual']:.3e}, "
+                    f"iters={cg_info['cg_iters']})."
+                ),
+                RuntimeWarning,
+            )
         
         # Step 3: Compute z1, z2
         z1 = y1 - apply_axis1(z) / a  # (n,)
@@ -851,17 +1016,25 @@ class TorchSinkhornHessian:
         yT = y.t()  # (d, m)
         vec1_z = a * z1  # (n,)
         Mat1_z = x * vec1_z[:, None]  # (n, d)
-        Mat2_z = apply_axis1(yT) * z1  # (d, n) * (n,) broadcast → (d, n)
+        
+        Mat2_raw = apply_axis1(yT)  # (d, m) → (d, n)
+        Mat2 = Mat2_raw * z1[None, :]  # (d, n)
+        
         vec2_z = apply_axis1(z2)  # (m,) → (n,)
         Mat3_z = x * vec2_z[:, None]  # (n, d)
-        Mat4_z = apply_axis1(yT * z2)  # (d, m) → (d, n)
-        RTz = 2 * (Mat1_z - Mat2_z.t() + Mat3_z - Mat4_z.t())  # (n, d)
+        
+        Mat4 = apply_axis1(yT * z2[None, :])  # (d, n)
+        
+        RTz = 2 * (Mat1_z - Mat2.t() + Mat3_z - Mat4.t())  # (n, d)
         
         # Step 5: Compute EA (E @ A)
         EA = self._compute_EA(A, epsilon, f, g, a, x, y, apply_axis1)  # (n, d)
         
         # Step 6: Combine
-        return RTz / epsilon + EA
+        hvp = RTz / epsilon + EA
+        if return_info:
+            return hvp, cg_info
+        return hvp
 
     def _conjugate_gradient(
         self,
@@ -870,7 +1043,9 @@ class TorchSinkhornHessian:
         max_iter: int = 100,
         rtol: float = 1e-6,
         atol: float = 1e-6,
-    ) -> torch.Tensor:
+        preconditioner=None,
+        return_info: bool = False,
+    ):
         """Simple conjugate gradient solver for Ax = b.
         
         Args:
@@ -881,27 +1056,68 @@ class TorchSinkhornHessian:
             atol: Absolute tolerance
             
         Returns:
-            Solution x
+            Solution x (and optional diagnostic dictionary when ``return_info`` is True).
         """
         x = torch.zeros_like(b)
         r = b.clone()
-        p = r.clone()
-        rsold = torch.dot(r, r)
-        
+        b_norm = torch.linalg.norm(b)
+
+        if b_norm == 0:
+            info = {
+                "cg_residual": 0.0,
+                "cg_iters": 0,
+                "cg_converged": True,
+                "cg_initial_residual": 0.0,
+            }
+            return (x, info) if return_info else x
+
+        if preconditioner is not None:
+            z = preconditioner(r)
+        else:
+            z = r.clone()
+
+        p = z.clone()
+        rz_old = torch.dot(r, z)
+        residual_norm = torch.linalg.norm(r)
+        converged = residual_norm <= atol + rtol * b_norm
+        num_iters = 0
+
         for i in range(max_iter):
+            if converged:
+                num_iters = i
+                break
+
             Ap = matvec(p)
-            alpha = rsold / (torch.dot(p, Ap) + 1e-10)
+            denom = torch.dot(p, Ap) + 1e-12
+            alpha = rz_old / denom
             x = x + alpha * p
             r = r - alpha * Ap
-            rsnew = torch.dot(r, r)
-            
-            if torch.sqrt(rsnew) < atol + rtol * torch.sqrt(rsold):
+            residual_norm = torch.linalg.norm(r)
+            converged = residual_norm <= atol + rtol * b_norm
+            if converged:
+                num_iters = i + 1
                 break
-                
-            beta = rsnew / (rsold + 1e-10)
-            p = r + beta * p
-            rsold = rsnew
-        
+
+            if preconditioner is not None:
+                z = preconditioner(r)
+            else:
+                z = r
+
+            rz_new = torch.dot(r, z)
+            beta = rz_new / (rz_old + 1e-12)
+            p = z + beta * p
+            rz_old = rz_new
+            num_iters = i + 1
+
+        info = {
+            "cg_residual": float(residual_norm.detach().cpu()),
+            "cg_iters": int(num_iters),
+            "cg_converged": bool(converged),
+            "cg_initial_residual": float(b_norm.detach().cpu()),
+        }
+
+        if return_info:
+            return x, info
         return x
 
 
@@ -1061,4 +1277,3 @@ class ShuffledRegression:
     def parames_error(params_list, w):
         w_t = torch.as_tensor(w)
         return [torch.linalg.norm(torch.as_tensor(p) - w_t).item() for p in params_list]
-

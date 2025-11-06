@@ -9,6 +9,7 @@ Complete PyTorch port of the Sinkhorn Hessian utilities with analytical formulas
 ✅ **torch.compile Support**: JIT compilation matching JAX performance  
 ✅ **Numerical Stability**: Log-domain Sinkhorn for extreme cases  
 ✅ **Full JAX Compatibility**: Verified to match within 3.34e-04  
+✅ **GeomLoss Backend (optional)**: Switch to `solver="geomloss"` to reuse GeomLoss' optimized Sinkhorn while preserving the squared Euclidean cost (no ½ factor)
 
 ---
 
@@ -66,7 +67,9 @@ solver = TorchSinkhornHessian(
     max_iterations=1000,      # Max Sinkhorn iterations
     dtype=torch.float64,      # Use float64 for numerical precision
     use_compile=True,         # Enable torch.compile (recommended)
-    use_keops=False          # KeOps for very large problems (experimental)
+    use_keops=False,          # KeOps for very large problems (experimental)
+    solver="native",          # or "geomloss" to leverage GeomLoss' Sinkhorn
+    geomloss_scaling=0.9      # GeomLoss blur annealing ratio (if solver="geomloss")
 )
 ```
 
@@ -81,9 +84,10 @@ solver = TorchSinkhornHessian(
 - Returns: (n, d, n, d) Hessian tensor
 - **Use for: n < 100**
 
-**`hessian_vector_product(ot, A, tau2=1e-5, max_cg_iter=200)`** → `torch.Tensor`
-- Computes Hessian @ A without materializing Hessian
-- Returns: (n, d) result vector
+**`hessian_vector_product(ot, A, tau2=1e-5, max_cg_iter=300, *, use_preconditioner=True, return_info=False)`** → `torch.Tensor` or `(torch.Tensor, dict)`
+- Computes Hessian @ A without materializing the Hessian
+- Neumann preconditioning (enabled by default) mirrors the JAX lineax setup for faster convergence
+- Returns: (n, d) result vector and, when `return_info=True`, a diagnostics dictionary containing CG residuals/iterations
 - **Use for: n > 50**
 
 **`dOTdx(ot)`** → `torch.Tensor`
@@ -285,4 +289,3 @@ Same as the original OTT-Hessian repository.
 ---
 
 **Status**: Production ready for research and applications! 🚀
-
