@@ -1,7 +1,7 @@
 import jax
 import numpy as np
 import jax.numpy as jnp
-from jaxtyping import Array, Float 
+from jaxtyping import Array, Float
 from jax.example_libraries import optimizers as jax_opt
 import optax
 import lineax as lx
@@ -16,191 +16,183 @@ from ott.solvers.linear import sinkhorn
 from ott.solvers.linear import implicit_differentiation as imp_diff
 
 
-def HessianAPrecond(A,out, tau2, iter):
-        f = out.f
-        g = out.g
-        n = len(f)
-        m = len(g)
-        epsilon = out.geom.epsilon
-        a = out.geom.apply_transport_from_potentials(f,g,jnp.ones(m),axis=1)
-        b = out.geom.apply_transport_from_potentials(f,g,jnp.ones(n),axis=0)
-        x = out.geom.x
-        y = out.geom.y
-        yT = y.T
-        
-        # RA
-        vec1 = jnp.sum(x * A, axis=1)
-        Mat1 = out.geom.apply_transport_from_potentials(f,g,y.T,axis=1)
-        x1  = 2*(a * vec1 - jnp.sum(A * Mat1.T, axis=1))
-        Mat2 = out.geom.apply_transport_from_potentials(f,g,A.T,axis=0)
-        x2 = 2*(out.geom.apply_transport_from_potentials(f,g, vec1,axis=0) - jnp.sum(y * Mat2.T, axis=1))
+def _transport_functions(out):
+    """Create cached transport application callables for the OT geometry."""
 
-        # Solve Hx
-        apply_potentials_1 = jax.jit(lambda x:  out.geom.apply_transport_from_potentials(f,g,x,axis=1))
-        apply_potentials_0 = jax.jit(lambda x:  out.geom.apply_transport_from_potentials(f,g,x,axis=0))
-        
-        y1= x1/(a)
-        y2 = -apply_potentials_0(y1) + x2
-        y2 = y2/(b+epsilon*tau2)
-        m = len(g)
+    f = out.f
+    g = out.g
+    geom = out.geom
+
+    apply_axis1 = jax.jit(lambda arr: geom.apply_transport_from_potentials(f, g, arr, axis=1))
+    apply_axis0 = jax.jit(lambda arr: geom.apply_transport_from_potentials(f, g, arr, axis=0))
+
+    return apply_axis0, apply_axis1
+
+
+def _prepare_common_terms(A, out):
+    """Pre-compute transport quantities shared by Hessian applications."""
+
+    apply_axis0, apply_axis1 = _transport_functions(out)
+
+    a = apply_axis1(jnp.ones_like(out.g))
+    b = apply_axis0(jnp.ones_like(out.f))
+
+    geom = out.geom
+    x = geom.x
+    y = geom.y
+    yT = y.T
+
+    vec_xA = jnp.einsum("nd,nd->n", x, A)
+    transport_yT = apply_axis1(yT)
+
+    transport_AT = apply_axis0(A.T)
+    vec_transport = apply_axis0(vec_xA)
+    vec_y_mat2 = jnp.sum(y * transport_AT.T, axis=1)
+
+    x1 = 2.0 * (a * vec_xA - jnp.einsum("nd,nd->n", A, transport_yT))
+    x2 = 2.0 * (vec_transport - vec_y_mat2)
+
+    return {
+        "apply_axis0": apply_axis0,
+        "apply_axis1": apply_axis1,
+        "a": a,
+        "b": b,
+        "epsilon": geom.epsilon,
+        "x": x,
+        "y": y,
+        "yT": yT,
+        "transport_yT": transport_yT,
+        "vec_xA": vec_xA,
+        "x1": x1,
+        "x2": x2,
+    }
+
+
+def _compute_mat5(common_terms, A):
+    """Vectorized computation of the Mat5 contribution."""
+
+    apply_axis1 = common_terms["apply_axis1"]
+    y = common_terms["y"]
+    epsilon = common_terms["epsilon"]
+
+    def _column_contrib(col):
+        transported = apply_axis1((col[:, None] * y).T)
+        return (-4.0 / epsilon) * jnp.sum(transported.T * A, axis=1)
+
+    return jax.vmap(_column_contrib, in_axes=1, out_axes=1)(y)
+
+
+def _assemble_result(common_terms, z1, z2, A):
+    """Assemble the final Hessian application using shared quantities."""
+
+    apply_axis1 = common_terms["apply_axis1"]
+    a = common_terms["a"]
+    epsilon = common_terms["epsilon"]
+    x = common_terms["x"]
+    y = common_terms["y"]
+    yT = common_terms["yT"]
+    transport_yT = common_terms["transport_yT"]
+    vec_xA = common_terms["vec_xA"]
+
+    vec1 = a * z1
+    mat1 = x * vec1[:, None]
+    mat2 = transport_yT * z1
+    vec2 = apply_axis1(z2)
+    mat3 = x * vec2[:, None]
+    mat4 = apply_axis1(yT * z2)
+    part1 = 2.0 * (mat1 - mat2.T + mat3 - mat4.T)
+
+    part2 = 2.0 * a[:, None] * A
+    part2 += (-4.0 / epsilon) * x * (vec_xA * a)[:, None]
+    Py = transport_yT
+    PyT = Py.T
+    part2 += (4.0 / epsilon) * PyT * vec_xA[:, None]
+    vec2_part = jnp.sum(PyT * A, axis=1)
+    part2 += (4.0 / epsilon) * x * vec2_part[:, None]
+    part2 += _compute_mat5(common_terms, A)
+
+    return part1 / epsilon + part2
+
+
+def HessianAPrecond(A,out, tau2, iter):
+        common_terms = _prepare_common_terms(A, out)
+
+        apply_axis0 = common_terms["apply_axis0"]
+        apply_axis1 = common_terms["apply_axis1"]
+        a = common_terms["a"]
+        b = common_terms["b"]
+        epsilon = common_terms["epsilon"]
+
+        y1 = common_terms["x1"] / a
+        y2_raw = -apply_axis0(y1) + common_terms["x2"]
+        denom = b + epsilon * tau2
+        inv_denom = 1.0 / denom
+        y2 = y2_raw * inv_denom
+        m = len(out.g)
 
         def B(z: Float[Array, str(m)]) -> Float[Array, str(m)]:
-            piz = apply_potentials_1(z)
-            piT_over_a_piz = apply_potentials_0(piz/a)
-            return piT_over_a_piz/(b+epsilon*tau2)
-        
+            piz = apply_axis1(z)
+            piT_over_a_piz = apply_axis0(piz / a)
+            return piT_over_a_piz * inv_denom
+
         def T(z: Float[Array, str(m)]) -> Float[Array, str(m)]:
             return z - B(z)
 
-
         in_structure = jax.eval_shape(lambda: y2)
-        preconditioner = lx.FunctionLinearOperator(lambda z: z + B(z) + B(B(z))+ B(B(B(z))) , 
-                                          in_structure, 
-                                          tags=[lx.positive_semidefinite_tag])
+        preconditioner = lx.FunctionLinearOperator(
+            lambda z: z + B(z) + B(B(z)) + B(B(B(z))),
+            in_structure,
+            tags=[lx.positive_semidefinite_tag],
+        )
 
-        
         fn_operator = lx.FunctionLinearOperator(T, in_structure, tags=lx.positive_semidefinite_tag)
-        
+
         solver = lx.CG(rtol=1e-6, atol=1e-6, max_steps=iter)
-        z_fun  = lx.linear_solve(fn_operator, y2, solver=solver, options={"preconditioner": preconditioner}, 
-                   throw=False)
+        z_fun = lx.linear_solve(
+            fn_operator,
+            y2,
+            solver=solver,
+            options={"preconditioner": preconditioner},
+            throw=False,
+        )
         z = z_fun.value
 
-
-        z1 = y1 - apply_potentials_1(z)/(a)
+        z1 = y1 - apply_axis1(z) / a
         z2 = z
 
-        # RTz
-        vec1 = a * z1 
-        Mat1 = x * vec1[:, None]
-        Mat2 = out.geom.apply_transport_from_potentials(f,g,yT,axis=1) * z1
-        vec2 = out.geom.apply_transport_from_potentials(f,g,z2,axis=1)
-        Mat3 = x * vec2[:, None]
-        Mat4 = out.geom.apply_transport_from_potentials(f, g, (yT * z2) , axis=1) 
-
-        Part1 = 2*(Mat1 - Mat2.T + Mat3 - Mat4.T)
-
-        # EA
-        n =  A.shape[0]
-        d =  A.shape[1]
-        Mat1 = 2 * a[:, None] * A
-        vec1 = jnp.sum(x * A, axis=1)
-        Mat2 = -4/epsilon * x * (vec1*a)[:, None]
-        Py   = out.geom.apply_transport_from_potentials(f,g,y.T,axis=1)
-        PyT = Py.T
-        Mat3 = 4/epsilon * PyT * vec1[:, None]
-        vec2 = jnp.sum(PyT * A , axis=1)
-        Mat4 = 4/epsilon * x * vec2[:, None]
-        Mat5 = jnp.zeros((n,d))
-        for i in range(d):
-            YiY = y[:,i][:,None] * y
-            Mat_i =  out.geom.apply_transport_from_potentials(f,g,YiY.T,axis=1).T
-            vec_i = jnp.sum(Mat_i * A, axis=1)
-            Mat5 = Mat5.at[:,i].set(-4/epsilon * vec_i)
-        
-        Part2 = Mat1 + Mat2 + Mat3 + Mat4 + Mat5
-
-        return Part1/epsilon+ Part2
+        return _assemble_result(common_terms, z1, z2, A)
             
 
 
     
 def HessianA(A,out, tau2, iter):
-        f = out.f
-        g = out.g
-        n = len(f)
-        m = len(g)
-        epsilon = out.geom.epsilon
-        a = out.geom.apply_transport_from_potentials(f,g,jnp.ones(m),axis=1)
-        b = out.geom.apply_transport_from_potentials(f,g,jnp.ones(n),axis=0)
-        x = out.geom.x
-        y = out.geom.y
-        yT = y.T
-        
-        # RA
-        vec1 = jnp.sum(x * A, axis=1)
-        Mat1 = out.geom.apply_transport_from_potentials(f,g,y.T,axis=1)
-        x1  = 2*(a * vec1 - jnp.sum(A * Mat1.T, axis=1))
-        Mat2 = out.geom.apply_transport_from_potentials(f,g,A.T,axis=0)
-        x2 = 2*(out.geom.apply_transport_from_potentials(f,g, vec1,axis=0) - jnp.sum(y * Mat2.T, axis=1))
+        common_terms = _prepare_common_terms(A, out)
 
-        # Solve Hx
-        apply_potentials_1 = jax.jit(lambda x:  out.geom.apply_transport_from_potentials(f,g,x,axis=1))
-        apply_potentials_0 = jax.jit(lambda x:  out.geom.apply_transport_from_potentials(f,g,x,axis=0))
+        apply_axis0 = common_terms["apply_axis0"]
+        apply_axis1 = common_terms["apply_axis1"]
+        a = common_terms["a"]
+        b = common_terms["b"]
+        epsilon = common_terms["epsilon"]
 
-        
-        y1= x1/(a)
-        y2 = -apply_potentials_0(y1) + x2
-        m = len(g)
+        y1 = common_terms["x1"] / a
+        y2 = -apply_axis0(y1) + common_terms["x2"]
+        m = len(out.g)
 
         def T(z: Float[Array, str(m)]) -> Float[Array, str(m)]:
-            piz = apply_potentials_1(z)
-            piT_over_a_piz = apply_potentials_0(piz/a)
-            return (b+epsilon*tau2)*z - piT_over_a_piz
-
-        #diag_T =jnp.zeros(m)
-        #for i in range(10):
-        #    v = np.random.randn(m)
-        #    diag_T = T(v)*v + diag_T
-        #diag_T = diag_T/10
-
-
-        #in_structure = jax.eval_shape(lambda: y2)
-        #preconditioner = lx.FunctionLinearOperator(lambda x: x  , 
-        #                                   in_structure, 
-        #                                   tags=[lx.positive_semidefinite_tag])
-
-        
-        #fn_operator = lx.FunctionLinearOperator(T, in_structure, tags=lx.positive_semidefinite_tag)
-        
-        #solver = lx.CG(rtol=1e-6, atol=1e-6, max_steps=iter)
-        #z_fun = lx.linear_solve(fn_operator, y2, solver=solver, options={"preconditioner": preconditioner}, 
-        #            throw=False)
-        #z = z_fun.value
-
+            piz = apply_axis1(z)
+            piT_over_a_piz = apply_axis0(piz / a)
+            return (b + epsilon * tau2) * z - piT_over_a_piz
 
         in_structure = jax.eval_shape(lambda: y2)
         fn_operator = lx.FunctionLinearOperator(T, in_structure, tags=lx.positive_semidefinite_tag)
-        
+
         solver = lx.CG(rtol=1e-6, atol=1e-6, max_steps=iter)
         z = lx.linear_solve(fn_operator, y2, solver, throw=False).value
 
-
-
-        z1 = y1 - apply_potentials_1(z)/(a)
+        z1 = y1 - apply_axis1(z) / a
         z2 = z
 
-        # RTz
-        vec1 = a * z1 
-        Mat1 = x * vec1[:, None]
-        Mat2 = out.geom.apply_transport_from_potentials(f,g,yT,axis=1) * z1
-        vec2 = out.geom.apply_transport_from_potentials(f,g,z2,axis=1)
-        Mat3 = x * vec2[:, None]
-        Mat4 = out.geom.apply_transport_from_potentials(f, g, (yT * z2) , axis=1) 
-
-        Part1 = 2*(Mat1 - Mat2.T + Mat3 - Mat4.T)
-
-        # EA
-        n =  A.shape[0]
-        d =  A.shape[1]
-        Mat1 = 2 * a[:, None] * A
-        vec1 = jnp.sum(x * A, axis=1)
-        Mat2 = -4/epsilon * x * (vec1*a)[:, None]
-        Py   = out.geom.apply_transport_from_potentials(f,g,y.T,axis=1)
-        PyT = Py.T
-        Mat3 = 4/epsilon * PyT * vec1[:, None]
-        vec2 = jnp.sum(PyT * A , axis=1)
-        Mat4 = 4/epsilon * x * vec2[:, None]
-        Mat5 = jnp.zeros((n,d))
-        for i in range(d):
-            YiY = y[:,i][:,None] * y
-            Mat_i =  out.geom.apply_transport_from_potentials(f,g,YiY.T,axis=1).T
-            vec_i = jnp.sum(Mat_i * A, axis=1)
-            Mat5 = Mat5.at[:,i].set(-4/epsilon * vec_i)
-        
-        Part2 = Mat1 + Mat2 + Mat3 + Mat4 + Mat5
-
-        return Part1/epsilon+ Part2
+        return _assemble_result(common_terms, z1, z2, A)
             
 
 
