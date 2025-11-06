@@ -1,8 +1,6 @@
-import argparse
 import jax
 import jax.numpy as jnp
 from jax import config
-
 config.update("jax_enable_x64", True)
 
 import time
@@ -17,6 +15,7 @@ from ott.problems.linear import linear_problem
 from ott.solvers.linear import sinkhorn
 
 import numpy as np
+import SinkhornHessian
 import util
 
 import matplotlib
@@ -25,20 +24,6 @@ import mpl_toolkits.axes_grid1
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Shuffled regression demo")
-    parser.add_argument(
-        "--backend",
-        choices=["jax", "torch"],
-        default="jax",
-        help="Choose between the original JAX or the new PyTorch backend.",
-    )
-    args = parser.parse_args()
-
-    if args.backend == "torch":
-        import torch_sinkhorn_hessian as SinkhornHessian  # noqa: F401
-    else:
-        import SinkhornHessian  # type: ignore[no-redef]
-
     d_X        = 5
     d_Y        = 2
     n          = 500 
