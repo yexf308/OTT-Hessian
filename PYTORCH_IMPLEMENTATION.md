@@ -41,19 +41,45 @@ hvp = solver.hessian_vector_product(ot, A)  # Never forms full Hessian!
 
 | Problem Size | Analytical | Autodiff | Speedup |
 |--------------|------------|----------|---------|
-| 10×3 | 0.027s | 8.8s | **324x** |
-| 20×3 | 0.006s | 26.8s | **4638x** |
-| 30×3 | 0.009s | 0.09s | **10x** |
+| 10×3 | 0.027s | 1 908s | **7.0×10⁴x** |
+| 20×3 | 0.006s | 1 031s | **1.6×10⁵x** |
+| 30×3 | 0.007s | 90.2s | **1.2×10⁴x** |
 
-**Average speedup: 1657x**
+**Average speedup (float64 CPU): ≈8.2×10⁴x**
 
-### Hessian-Vector Products
+### GPU Benchmark (H100, ε = 0.05, τ² = 1e-5)
 
-| Problem Size | Memory (Full) | Memory (HVP) | Savings | Error |
-|--------------|---------------|--------------|---------|-------|
-| 10×3 | 0.007 MB | 0.0002 MB | 30x | 2.25e-04 |
-| 20×3 | 0.028 MB | 0.0005 MB | 60x | 1.19e-04 |
-| 50×3 | 0.172 MB | 0.001 MB | 150x | < 1e-03 |
+Benchmarks use float64 tensors on an NVIDIA H100 (CUDA 12.1), comparing the native PyTorch solver, the GeomLoss backend, and the analytic JAX reference. Relative errors are measured against JAX.
+
+**n = 128**
+
+| Backend | Solve (s) | Grad (s) | HVP (s) | Grad rel vs JAX | HVP rel vs JAX |
+|---------|-----------|----------|---------|-----------------|----------------|
+| JAX | 5.51 | 0.37 | 5.25 | 0 | 0 |
+| Torch (native) | 2.27 | 35.90 | 0.25 | 2.2e-4 | 1.1e-4 |
+| Torch (geomloss) | 0.32 | 7.6e-05 | 0.17 | 7.8e-4 | 1.0e-3 |
+
+| Backend | Solve mem (MB) | Grad mem (MB) | HVP mem (MB) |
+|---------|----------------|----------------|---------------|
+| JAX | 1.28 | ~0 | ~0 |
+| Torch (native) | 0.93 | 2643 | 34.2 |
+| Torch (geomloss) | 34.8 | 34.6 | 34.5 |
+
+**n = 256**
+
+| Backend | Solve (s) | Grad (s) | HVP (s) | Grad rel vs JAX | HVP rel vs JAX |
+|---------|-----------|----------|---------|-----------------|----------------|
+| JAX | 4.03 | 0.30 | 4.05 | 0 | 0 |
+| Torch (native) | 10.67 | 99.73 | 0.03 | 3.5e-5 | 3.6e-5 |
+| Torch (geomloss) | 0.07 | 7.9e-05 | 0.03 | 5.4e-4 | 8.6e-4 |
+
+| Backend | Solve mem (MB) | Grad mem (MB) | HVP mem (MB) |
+|---------|----------------|----------------|---------------|
+| JAX | 3.11 | ~0 | ~0 |
+| Torch (native) | 37.3 | 10566 | 37.3 |
+| Torch (geomloss) | 38.3 | 37.8 | 37.3 |
+
+GeomLoss achieves the fastest solves while keeping gradients/HVPs within ~10^-3 relative error of the JAX baseline; the native solver matches to ~10^-4 but incurs substantially higher autograd memory/time during gradient evaluation.
 
 ---
 
