@@ -9,7 +9,11 @@ Complete PyTorch port of the Sinkhorn Hessian utilities with analytical formulas
 ✅ **torch.compile Support**: JIT compilation matching JAX performance  
 ✅ **Numerical Stability**: Log-domain Sinkhorn for extreme cases  
 ✅ **Full JAX Compatibility**: Verified to match within 3.34e-04  
-✅ **GeomLoss Backend (optional)**: Switch to `solver="geomloss"` to reuse GeomLoss' optimized Sinkhorn while preserving the squared Euclidean cost (no ½ factor)
+<<<<<<< HEAD
+✅ **GeomLoss Backend (optional)**: Switch to `solver="geomloss"` to reuse GeomLoss' optimized Sinkhorn while preserving the squared Euclidean cost (no ½ factor) with balanced transport plans
+=======
+✅ **GeomLoss Backend (optional)**: Switch to `solver="geomloss"` to reuse GeomLoss' optimized Sinkhorn while preserving the squared Euclidean cost (no ½ factor) with balanced transport plans
+>>>>>>> 7a82419 (Add GeomLoss Sinkhorn backend with balanced plan and gradients)
 
 ---
 
@@ -68,9 +72,13 @@ solver = TorchSinkhornHessian(
     dtype=torch.float64,      # Use float64 for numerical precision
     use_compile=True,         # Enable torch.compile (recommended)
     use_keops=False,          # KeOps for very large problems (experimental)
-    solver="native",          # or "geomloss" to leverage GeomLoss' Sinkhorn
-    geomloss_scaling=0.9      # GeomLoss blur annealing ratio (if solver="geomloss")
+    solver="native",          # Set to "geomloss" to leverage GeomLoss' Sinkhorn
+    geomloss_scaling=0.9      # Blur annealing ratio when solver="geomloss"
 )
+
+# Example: use GeomLoss backend (requires geomloss>=0.2.6)
+# solver = TorchSinkhornHessian(svd_thr=1e-10, solver="geomloss")
+# Plans are rebalanced and gradients/HVPs remain consistent with the native backend.
 ```
 
 #### Main Methods
@@ -78,6 +86,7 @@ solver = TorchSinkhornHessian(
 **`solve_ott(x, y, mu, nu, epsilon, threshold)`** → `TorchOTResult`
 - Solves entropic optimal transport problem
 - Returns: OT solution with transport plan, cost, dual potentials
+- When `solver="geomloss"`, the class delegates to GeomLoss' tensorized Sinkhorn, rebalances the resulting plan, recomputes the entropic cost, and exposes duals compatible with the native/JAX backends.
 
 **`compute_hessian(ot)`** → `torch.Tensor`
 - Analytical Hessian with SVD regularization
