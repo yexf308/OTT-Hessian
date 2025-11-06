@@ -10,7 +10,7 @@ points through :mod:`torch.autograd`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -255,6 +255,7 @@ class TorchSinkhornHessian:
             sinkhorn_impl = _sinkhorn
         self.use_compile = sinkhorn_impl is not _sinkhorn
         self._sinkhorn = sinkhorn_impl
+        self._fallback_sinkhorn = _sinkhorn
 
     # ------------------------------------------------------------------
     # Solver utilities
@@ -282,8 +283,11 @@ class TorchSinkhornHessian:
         epsilon: float,
         threshold: float,
         max_iterations: int,
+        *,
+        impl: Optional[Callable[..., tuple]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
-        result = self._sinkhorn(
+        sinkhorn_impl = self._sinkhorn if impl is None else impl
+        result = sinkhorn_impl(
             x,
             y,
             mu,
@@ -326,6 +330,7 @@ class TorchSinkhornHessian:
             residual is not None
             and residual.detach().cpu().item() > threshold
             and self.max_iterations > _COMPILED_MAX_ITERS
+            and self.use_compile
         ):
             cost, plan, _, iterations_value, _ = self._run_sinkhorn(
                 x_t,
@@ -335,6 +340,7 @@ class TorchSinkhornHessian:
                 eps,
                 threshold,
                 self.max_iterations,
+                impl=self._fallback_sinkhorn,
             )
         geom = _TorchGeometry(x=x_t, y=y_t, epsilon=eps)
         return TorchOTResult(
@@ -600,7 +606,7 @@ class ShuffledRegression:
         return self.x @ params
 
     @staticmethod
-    def parames_error(params_list, w):
+    def params_error(params_list, w):
         w_t = torch.as_tensor(w)
         return [torch.linalg.norm(torch.as_tensor(p) - w_t).item() for p in params_list]
 
